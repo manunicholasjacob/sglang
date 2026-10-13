@@ -456,6 +456,65 @@ def _query_numa_node_for_gpu(device_id: int):
             pass  # Ignore shutdown errors
 
 
+_CGROUP_V2_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+_CGROUP_V1_CPU_DIRS = ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct")
+
+
+def _read_text(path: str) -> Optional[str]:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _cgroup_cpu_quota() -> Optional[float]:
+    # --cpus=4 or a k8s limits.cpu of 4 shows up only here; the cpuset still
+    # lists every host core. None means unlimited or unreadable.
+    cpu_max = _read_text(_CGROUP_V2_CPU_MAX)
+    if cpu_max is not None:
+        parts = cpu_max.split()
+        if len(parts) != 2 or parts[0] == "max":
+            return None
+        try:
+            quota, period = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        return quota / period if quota > 0 and period > 0 else None
+    for cpu_dir in _CGROUP_V1_CPU_DIRS:
+        quota_s = _read_text(os.path.join(cpu_dir, "cpu.cfs_quota_us"))
+        period_s = _read_text(os.path.join(cpu_dir, "cpu.cfs_period_us"))
+        if quota_s is None or period_s is None:
+            continue
+        try:
+            quota, period = int(quota_s), int(period_s)
+        except ValueError:
+            return None
+        return quota / period if quota > 0 and period > 0 else None
+    return None
+
+
+def _cap_cpu_ids_by_cgroup_quota(*, cpu_ids: str, world_size: int) -> str:
+    # One pinned OpenMP thread per listed CPU. More threads than the quota burn
+    # it early in each CFS period and the rank stalls until the next one.
+    quota = _cgroup_cpu_quota()
+    cpus = [c for c in cpu_ids.split(",") if c]
+    if quota is None or not cpus:
+        return cpu_ids
+    # The quota covers every rank in the cgroup, not each rank.
+    per_rank = max(1, math.floor(quota / max(1, world_size)))
+    if per_rank >= len(cpus):
+        return cpu_ids
+    capped = ",".join(cpus[:per_rank])
+    logger.warning(
+        f"cgroup CPU quota is {quota:g} CPUs shared by {world_size} rank(s), "
+        f"fewer than the {len(cpus)} CPUs selected for this rank; binding "
+        f"{per_rank} OpenMP thread(s) to {capped} to avoid CFS throttling. "
+        f"Set SGLANG_CPU_OMP_THREADS_BIND explicitly to override."
+    )
+    return capped
+
+
 def init_threads_binding(
     *,
     numa_index: int,
@@ -484,7 +543,9 @@ def init_threads_binding(
             f"is out of range for {n_numa_node} numa nodes. This usually means dp_size * tp_size "
             f"exceeds the number of numa nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
         )
-        local_omp_cpuid = cpu_ids_by_node[numa_index]
+        local_omp_cpuid = _cap_cpu_ids_by_cgroup_quota(
+            cpu_ids=cpu_ids_by_node[numa_index], world_size=world_size
+        )
     else:
         threads_bind_list = omp_cpuids.split("|")
         # Bound-check numa_index against the bind list rather than asserting
